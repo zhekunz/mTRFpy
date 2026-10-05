@@ -17,7 +17,6 @@ from mtrf.stats import (
 from mtrf.matrices import (
     covariance_matrices,
     banded_regularization,
-    regularization_matrix,
     fit_weights_with_covariance_matrices,
     lag_matrix,
     truncate,
@@ -28,7 +27,11 @@ from mtrf.matrices import (
     ArrayList,
     lags_idx,
     is_scalar,
-    is_torch_namespace,
+    array_device,
+    creation_kwargs,
+    asarray_like,
+    weights_to_trf,
+    trf_to_weights,
 )
 import array_api_compat
 
@@ -225,6 +228,8 @@ class TRF:
         stimulus, response, n_trials = _check_length(stimulus, response)
         if not xps == xpr:
             raise TypeError("stimulus and response trials must be of the same type!")
+        elif array_device(stimulus[0]) != array_device(response[0]):
+            raise TypeError("stimulus and response trials must be on the same device!")
         else:
             xp = xps
         if not is_scalar(regularization):
@@ -232,6 +237,7 @@ class TRF:
         x, y, tmin, tmax = _get_xy(stimulus, response, tmin, tmax, self.direction)
         lags = lags_idx(xp, tmin, tmax, fs)
         if self.method == "banded":
+            regularization = asarray_like(xp, regularization, x[0])
             coefficients = list(product(regularization, repeat=len(bands)))
             regularization = xp.stack(
                 [banded_regularization(len(lags), c, bands, xp) for c in coefficients],
@@ -242,7 +248,7 @@ class TRF:
             return
         else:  # run cross-validation once per regularization parameter
             # pre-compute covariance matrices
-            regularization = xp.asarray(regularization)
+            regularization = asarray_like(xp, regularization, x[0])
             cov_xx, cov_xy = None, None
             if self.preload:
                 cov_xx, cov_xy = covariance_matrices(
@@ -252,10 +258,11 @@ class TRF:
                 cov_xx, cov_xy = None, None
             if reg_per_y_channel:
                 metric = xp.zeros(
-                    (len(regularization), y[0].shape[-1]), dtype=x[0].dtype
+                    (len(regularization), y[0].shape[-1]),
+                    **creation_kwargs(x[0]),
                 )
             else:
-                metric = xp.zeros(len(regularization), dtype=x[0].dtype)
+                metric = xp.zeros(len(regularization), **creation_kwargs(x[0]))
             for ir in _progressbar(
                 range(len(regularization)),
                 "Hyperparameter optimization",
@@ -315,7 +322,7 @@ class TRF:
         # regmat = regularization_matrix(cov_xx.shape[1], xp, self.method)
         # regmat *= regularization / (1 / self.fs)
         # weight_matrix = xp.linalg.solve((cov_xx + regmat), cov_xy) / (1 / self.fs)
-        weight_matrix = xp.zeros(cov_xy.shape, dtype=x[0].dtype)
+        weight_matrix = xp.zeros(cov_xy.shape, **creation_kwargs(x[0]))
         if reg_per_y_channel:
             unique_reg_values = xp.unique(regularization)
             reg_y_chan_dict = {
@@ -340,15 +347,13 @@ class TRF:
                 reg_method=self.method,
             )
 
-        if is_torch_namespace(weight_matrix):
-            weight_matrix = weight_matrix.cpu().numpy()
         self.bias = weight_matrix[0:1]
         if self.bias.ndim == 1:  # add empty dimension for single feature models
             self.bias = xp.expand_dims(self.bias, axis=0)
-        self.weights = weight_matrix[1:].reshape(
-            (x[0].shape[1], len(lags), y[0].shape[1]), order="F"
+        self.weights = weights_to_trf(
+            weight_matrix[1:], x[0].shape[1], len(lags), y[0].shape[1], xp
         )
-        self.times = xp.asarray(lags) / fs
+        self.times = asarray_like(xp, lags, x[0]) / fs
         self.fs = fs
 
     def predict(
@@ -419,6 +424,10 @@ class TRF:
                 raise TypeError(
                     "stimulus and response trials must be of the same type!"
                 )
+            if array_device(stimulus[0]) != array_device(response[0]):
+                raise TypeError(
+                    "stimulus and response trials must be on the same device!"
+                )
         x, y, _, _ = _get_xy(
             stimulus,
             response,
@@ -427,30 +436,26 @@ class TRF:
             direction=self.direction,
         )
         prediction = [
-            xp.zeros((x_i.shape[0], self.weights.shape[-1]), dtype=x_i.dtype)
+            xp.zeros(
+                (x_i.shape[0], self.weights.shape[-1]), **creation_kwargs(x_i)
+            )
             for x_i in x
         ]
         if y[0] is not None:
-            metric = xp.zeros((len(x), self.weights.shape[-1]), dtype=x[0].dtype)
+            metric = xp.zeros(
+                (len(x), self.weights.shape[-1]), **creation_kwargs(x[0])
+            )
         for i, (x_i, y_i) in enumerate(zip(x, y)):
-            times = xp.asarray(self.times)
+            times = asarray_like(xp, self.times, x_i)
             lags = lags_idx(xp, times[0], times[-1], self.fs)
-            w = self.weights.copy()
-            xp_w = array_api_compat.get_namespace(w)
+            w = asarray_like(xp, self.weights, x_i, copy=True)
+            bias = asarray_like(xp, self.bias, x_i, copy=True)
             if lag is not None:  # select lag and corresponding weights
                 if not isinstance(lag, Iterable):
                     lag = [lag]
-                lags = list(xp.array(lags)[lag])
+                lags = [lags[i] for i in lag]
                 w = w[:, lag, :]
-            w = xp_w.concat(
-                [
-                    self.bias,
-                    w.reshape(
-                        x_i.shape[-1] * len(lags), self.weights.shape[-1], order="F"
-                    ),
-                ]
-            ) * (1 / self.fs)
-            w = xp.asarray(w)
+            w = xp.concatenate([bias, trf_to_weights(w, xp)], axis=0) * (1 / self.fs)
             x_lag = lag_matrix(x_i, lags, self.zeropad)
             y_pred = x_lag @ w
             if y_i is not None:
@@ -544,7 +549,10 @@ class TRF:
         trf = TRF()
         for k, v in self.__dict__.items():
             value = v
-            if getattr(v, "copy", None) is not None:
+            if array_api_compat.is_array_api_obj(v):
+                xp = array_api_compat.array_namespace(v)
+                value = asarray_like(xp, v, v, copy=True)
+            elif getattr(v, "copy", None) is not None:
                 value = v.copy()
             setattr(trf, k, value)
         return trf

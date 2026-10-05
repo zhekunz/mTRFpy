@@ -37,6 +37,7 @@ setup(
             "black",
         ],
         "docs": ["sphinx", "sphinx_rtd_theme", "mne", "matplotlib"],
+        "torch": ["torch"],
         "full": ["mtrf[testing]", "mtrf[docs]"],
     },
     packages=find_packages(),

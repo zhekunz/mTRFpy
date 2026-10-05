@@ -10,6 +10,43 @@ Array = TypeVar("Array")
 ArrayList = List[Array]
 
 
+def array_device(x):
+    """Return an array's device, or ``None`` for backends without devices."""
+    return getattr(x, "device", None)
+
+
+def creation_kwargs(x):
+    """Keyword arguments for creating an array alongside ``x``."""
+    kwargs = {"dtype": x.dtype}
+    device = array_device(x)
+    if device is not None:
+        kwargs["device"] = device
+    return kwargs
+
+
+def asarray_like(xp, value, like, dtype=None, copy=None):
+    """Create an array in the same namespace and on the same device as ``like``."""
+    kwargs = {"dtype": like.dtype if dtype is None else dtype}
+    device = array_device(like)
+    if device is not None:
+        kwargs["device"] = device
+    if copy is not None:
+        kwargs["copy"] = copy
+    return xp.asarray(value, **kwargs)
+
+
+def weights_to_trf(weight_matrix, n_features, n_lags, n_outputs, xp):
+    """Convert lag-major regression weights to features-by-lags-by-outputs."""
+    weights = xp.reshape(weight_matrix, (n_lags, n_features, n_outputs))
+    return xp.permute_dims(weights, (1, 0, 2))
+
+
+def trf_to_weights(weights, xp):
+    """Flatten features-by-lags-by-outputs weights in lag-major order."""
+    weights = xp.permute_dims(weights, (1, 0, 2))
+    return xp.reshape(weights, (-1, weights.shape[-1]))
+
+
 def _check_data(data: Union[ArrayList, Array]) -> Tuple[ArrayList, ModuleType]:
     """
     Ensure correct data formatting
@@ -43,6 +80,9 @@ def _check_data(data: Union[ArrayList, Array]) -> Tuple[ArrayList, ModuleType]:
             data = [data]
     if not all([is_array_api_obj(d) for d in data]):
         raise TypeError("Trials must be arrays!")
+    devices = [array_device(d) for d in data]
+    if any(device != devices[0] for device in devices[1:]):
+        raise TypeError("All trials must be on the same device!")
     for i, d in enumerate(data):
         if d.ndim == 1:
             data[i] = xp.expand_dims(d, axis=1)
@@ -222,11 +262,12 @@ def covariance_matrices(
         x_lag = lag_matrix(x_i, lags, zeropad)
         if preload is True:
             if i == 0:
+                kwargs = creation_kwargs(x_lag)
                 cov_xx = xp.zeros(
-                    (len(x), x_lag.shape[-1], x_lag.shape[-1]), dtype=x_lag.dtype
+                    (len(x), x_lag.shape[-1], x_lag.shape[-1]), **kwargs
                 )
                 cov_xy = xp.zeros(
-                    (len(y), x_lag.shape[-1], y_i.shape[-1]), dtype=x_lag.dtype
+                    (len(y), x_lag.shape[-1], y_i.shape[-1]), **kwargs
                 )
             cov_xx[i] = x_lag.T @ x_lag
             cov_xy[i] = x_lag.T @ y_i
@@ -271,7 +312,8 @@ def lag_matrix(
     n_samples, n_variables = x.shape
     if max(lags) > n_samples:
         raise ValueError("The maximum lag can't be longer than the signal!")
-    x_lag = xp.zeros((n_samples, n_variables * n_lags), dtype=x.dtype)
+    kwargs = creation_kwargs(x)
+    x_lag = xp.zeros((n_samples, n_variables * n_lags), **kwargs)
 
     for idx, lag in enumerate(lags):
         col_slice = slice(idx * n_variables, (idx + 1) * n_variables)
@@ -286,7 +328,8 @@ def lag_matrix(
         x_lag = truncate(x_lag, lags[0], lags[-1])
 
     if bias is not False:
-        x_lag = xp.concatenate([xp.ones((x_lag.shape[0], 1), dtype=x.dtype), x_lag], 1)
+        bias_column = xp.ones((x_lag.shape[0], 1), **kwargs)
+        x_lag = xp.concatenate([bias_column, x_lag], 1)
 
     return x_lag
 
@@ -296,6 +339,7 @@ def regularization_matrix(
     xp: ModuleType,
     method: Literal["ridge", "banded", "tikhonov"] = "ridge",
     dtype=None,
+    device=None,
 ) -> Array:
     """
     Generates a sparse regularization matrix for the specified method.
@@ -316,14 +360,17 @@ def regularization_matrix(
     """
     if dtype is None:
         dtype = xp.float64
+    kwargs = {"dtype": dtype}
+    if device is not None:
+        kwargs["device"] = device
     if method in ["ridge", "banded"]:
-        regmat = xp.eye(size, dtype=dtype)
+        regmat = xp.eye(size, **kwargs)
         regmat[0, 0] = 0
     elif method == "tikhonov":
-        regmat = xp.eye(size, dtype=dtype)
+        regmat = xp.eye(size, **kwargs)
         regmat -= 0.5 * (
-            xp.diag(xp.ones(size - 1, dtype=dtype), 1)
-            + xp.diag(xp.ones(size - 1, dtype=dtype), -1)
+            xp.diag(xp.ones(size - 1, **kwargs), 1)
+            + xp.diag(xp.ones(size - 1, **kwargs), -1)
         )
         regmat[1, 1] = 0.5
         regmat[size - 1, size - 1] = 0.5
@@ -331,7 +378,7 @@ def regularization_matrix(
         regmat[0, 1] = 0
         regmat[1, 0] = 0
     else:
-        regmat = xp.zeros((size, size), dtype=dtype)
+        regmat = xp.zeros((size, size), **kwargs)
     return regmat
 
 
@@ -370,7 +417,11 @@ def banded_regularization(
     lag_coefs = xp.concatenate(lag_coefs)
     # repeat that sequence for each lag
     diagonal = xp.concatenate([lag_coefs for i in range(n_lags)])
-    diagonal = xp.concatenate([[0], diagonal])
+    device_kwargs = {}
+    if array_device(diagonal) is not None:
+        device_kwargs["device"] = array_device(diagonal)
+    zero = xp.zeros(1, dtype=diagonal.dtype, **device_kwargs)
+    diagonal = xp.concatenate([zero, diagonal])
     return xp.diag(diagonal)
 
 
@@ -406,7 +457,15 @@ def fit_weights_with_covariance_matrices(
         the weight matrix
     """
     xp = get_namespace(cov_xx)
-    regmat = regularization_matrix(cov_xx.shape[1], xp, reg_method, dtype=cov_xx.dtype)
+    if is_array_api_obj(regularization):
+        regularization = asarray_like(xp, regularization, cov_xx)
+    regmat = regularization_matrix(
+        cov_xx.shape[1],
+        xp,
+        reg_method,
+        dtype=cov_xx.dtype,
+        device=array_device(cov_xx),
+    )
     regmat *= regularization / (1 / fs)
     weight_matrix = xp.linalg.solve((cov_xx + regmat), cov_xy) / (1 / fs)
     return weight_matrix

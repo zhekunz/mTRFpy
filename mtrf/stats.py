@@ -9,7 +9,6 @@ from collections.abc import Iterable
 import array_api_compat
 
 from mtrf.matrices import (
-    regularization_matrix,
     covariance_matrices,
     banded_regularization,
     _check_data,
@@ -19,6 +18,11 @@ from mtrf.matrices import (
     ArrayList,
     lags_idx,
     is_scalar,
+    array_device,
+    creation_kwargs,
+    asarray_like,
+    weights_to_trf,
+    fit_weights_with_covariance_matrices,
 )
 
 
@@ -62,9 +66,13 @@ def pearsonr(y: Array, y_pred: Array) -> Array:
         Pearsons r for each feature in y.
     """
     xp = array_api_compat.array_namespace(y)
-    r = xp.mean((y - y.mean(0)) * (y_pred - y_pred.mean(0)), axis=0) / (
-        y.std(0) * y_pred.std(0)
+    numerator = xp.mean(
+        (y - xp.mean(y, axis=0)) * (y_pred - xp.mean(y_pred, axis=0)), axis=0
     )
+    denominator = xp.std(y, axis=0, correction=0) * xp.std(
+        y_pred, axis=0, correction=0
+    )
+    r = numerator / denominator
     return r
 
 
@@ -128,6 +136,8 @@ def crossval(
     assert n_trials >= k, f"Not enough trials for {k}-fold cross-validation"
     if not xps == xpr:
         raise TypeError("stimulus and response trials must be of the same type!")
+    elif array_device(stimulus[0]) != array_device(response[0]):
+        raise TypeError("stimulus and response trials must be on the same device!")
     else:
         xp = xps
     if isinstance(regularization, Iterable):
@@ -142,7 +152,12 @@ def crossval(
     #     random.seed(seed)
     x, y, tmin, tmax = _get_xy(stimulus, response, tmin, tmax, model.direction)
     lags = lags_idx(xp, tmin, tmax, fs)
-    cov_xx, cov_xy = covariance_matrices(x, y, lags, model.zeropad, trf.preload)
+    if trf.preload:
+        cov_xx, cov_xy = covariance_matrices(
+            x, y, lags, model.zeropad, preload=True
+        )
+    else:
+        cov_xx, cov_xy = None, None
     metric = _crossval(
         model,
         x,
@@ -241,6 +256,8 @@ def nested_crossval(
     k = _check_k(k, n_trials)
     if not xps == xpr:
         raise TypeError("stimulus and response trials must be of the same type!")
+    elif array_device(stimulus[0]) != array_device(response[0]):
+        raise TypeError("stimulus and response trials must be on the same device!")
     else:
         xp = xps
     if average is False and not is_scalar(regularization):
@@ -248,7 +265,8 @@ def nested_crossval(
     x, y, tmin, tmax = _get_xy(stimulus, response, tmin, tmax, model.direction)
     lags = lags_idx(xp, tmin, tmax, fs)
     if model.method == "banded":
-        coefficients = list(product(regularization, repeat=2))
+        regularization = asarray_like(xp, regularization, x[0])
+        coefficients = list(product(regularization, repeat=len(bands)))
         regularization = [
             banded_regularization(len(lags), c, bands, xp) for c in coefficients
         ]
@@ -258,23 +276,26 @@ def nested_crossval(
     else:
         cov_xx, cov_xy = None, None
 
-    splits = xp.array_split(xp.arange(n_trials), k)
+    splits = _trial_splits(n_trials, k)
     n_splits = len(splits)
-    metric_test = xp.zeros(n_splits, dtype=x[0].dtype)
+    metric_test = xp.zeros(n_splits, **creation_kwargs(x[0]))
     best_regularization = []
     for split_i in range(n_splits):
         idx_test = splits[split_i]
-        idx_train_val = xp.concatenate(splits[:split_i] + splits[split_i + 1 :])
+        idx_train_val = sum(splits[:split_i] + splits[split_i + 1 :], [])
         if not is_scalar(regularization):
-            metric = xp.zeros(len(regularization), dtype=x[0].dtype)
+            metric = xp.zeros(len(regularization), **creation_kwargs(x[0]))
             for ir in _progressbar(
                 range(len(regularization)),
                 "Hyperparameter optimization",
                 verbose=verbose,
             ):
                 if cov_xx is not None:
-                    cov_xx_train = cov_xx[idx_train_val, :, :]
-                    cov_xy_train = cov_xy[idx_train_val, :, :]
+                    cov_idx = asarray_like(
+                        xp, idx_train_val, cov_xx, dtype=xp.int64
+                    )
+                    cov_xx_train = cov_xx[cov_idx, :, :]
+                    cov_xy_train = cov_xy[cov_idx, :, :]
                 else:
                     cov_xx_train, cov_xy_train = None, None
                 metric[ir] = _crossval(
@@ -292,10 +313,12 @@ def nested_crossval(
                     average=average,
                     verbose=verbose,
                 )
-            regularization_split_i = list(regularization)[xp.argmax(metric)]
+            best_idx = int(xp.argmax(metric).item())
+            regularization_split_i = regularization[best_idx]
         else:
             regularization_split_i = regularization
-        model._train(
+        fold_model = model.copy()
+        fold_model._train(
             [x[i] for i in idx_train_val],
             [y[i] for i in idx_train_val],
             fs,
@@ -304,7 +327,7 @@ def nested_crossval(
             regularization_split_i,
             # xp,
         )
-        _, metric_test[split_i] = model.predict(
+        _, metric_test[split_i] = fold_model.predict(
             [stimulus[i] for i in idx_test], [response[i] for i in idx_test]
         )
         best_regularization.append(regularization_split_i)
@@ -326,27 +349,18 @@ def _crossval(
     verbose=True,
     seed=None,
 ):
-    if seed is not None:
-        random.seed(seed)
-
-    reg_mat_size = x[0].shape[-1] * len(lags) + 1
-    regmat = regularization_matrix(reg_mat_size, xp, model.method, dtype=x[0].dtype)
-    regmat *= regularization / (1 / fs)
-
     n_trials = len(x)
     k = _check_k(k, n_trials)
-    splits = xp.arange(n_trials)
-    random.shuffle(splits)
-    splits = xp.array_split(splits, k)
+    splits = _trial_splits(n_trials, k, seed=seed, shuffle=True)
 
     if average is True:
-        metric = xp.zeros(k, dtype=x[0].dtype)
+        metric = xp.zeros(k, **creation_kwargs(x[0]))
     else:
-        metric = xp.zeros((k, y[0].shape[-1]), dtype=x[0].dtype)
+        metric = xp.zeros((k, y[0].shape[-1]), **creation_kwargs(x[0]))
 
     for isplit in _progressbar(range(len(splits)), "Cross-validating", verbose=verbose):
         idx_val = splits[isplit]
-        idx_train = xp.concat(splits[:isplit] + splits[isplit + 1 :])  # flatten
+        idx_train = sum(splits[:isplit] + splits[isplit + 1 :], [])
         if cov_xx is None:
             x_train = [x[i] for i in idx_train]
             y_train = [y[i] for i in idx_train]
@@ -354,15 +368,19 @@ def _crossval(
                 x_train, y_train, lags, model.zeropad, preload=False
             )
         else:
-            cov_xx_hat = cov_xx[idx_train].mean(axis=0)
-            cov_xy_hat = cov_xy[idx_train].mean(axis=0)
-        w = xp.matmul(xp.linalg.inv(cov_xx_hat + regmat), cov_xy_hat) / (1 / fs)
+            cov_idx = asarray_like(xp, idx_train, cov_xx, dtype=xp.int64)
+            cov_xx_hat = cov_xx[cov_idx].mean(axis=0)
+            cov_xy_hat = cov_xy[cov_idx].mean(axis=0)
+        w = fit_weights_with_covariance_matrices(
+            cov_xx_hat, cov_xy_hat, fs, regularization, model.method
+        )
         trf = model.copy()
-        trf.times, trf.bias, trf.fs = xp.array(lags) / fs, w[0:1], fs
+        trf.times = asarray_like(xp, lags, x[0]) / fs
+        trf.bias, trf.fs = w[0:1], fs
         if trf.bias.ndim == 1:
             trf.bias = xp.expand_dims(trf.bias, 1)
-        trf.weights = w[1:].reshape(
-            (x[0].shape[-1], len(lags), y[0].shape[-1]), order="F"
+        trf.weights = weights_to_trf(
+            w[1:], x[0].shape[-1], len(lags), y[0].shape[-1], xp
         )
         x_test, y_test = [x[i] for i in idx_val], [y[i] for i in idx_val]
         # because we are working with covariance matrices, we have to check direction
@@ -514,3 +532,18 @@ def _check_k(k, n_trials):
     if k == -1:  # do leave-one-out cross-validation
         k = n_trials
     return k
+
+
+def _trial_splits(n_trials, k, seed=None, shuffle=False):
+    """Split host-side trial indices without creating device scalar indices."""
+    indices = list(range(n_trials))
+    if shuffle:
+        random.Random(seed).shuffle(indices)
+    quotient, remainder = divmod(n_trials, k)
+    sizes = [quotient + (i < remainder) for i in range(k)]
+    splits = []
+    start = 0
+    for size in sizes:
+        splits.append(indices[start : start + size])
+        start += size
+    return splits

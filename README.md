@@ -28,6 +28,34 @@ Or get the latest version from this repo:
     pip install git+https://github.com/powerfulbean/mTRFpy.git
 ```
 
+## GPU acceleration
+
+Cross-validation and model fitting use the array backend and device of the input
+data. Install the optional PyTorch dependency and move every trial to a CUDA device:
+
+```sh
+pip install "mtrf[torch]"
+```
+
+```python
+import torch
+from mtrf.model import TRF
+from mtrf.stats import crossval
+
+stimulus_cuda = [torch.as_tensor(x, device="cuda") for x in stimulus]
+response_cuda = [torch.as_tensor(y, device="cuda") for y in response]
+
+metric = crossval(
+    TRF(), stimulus_cuda, response_cuda, fs, tmin, tmax,
+    regularization=1.0, k=5,
+)
+assert metric.is_cuda
+```
+
+Stimulus and response trials must use the same backend and device. GPU acceleration
+is most useful for models with large covariance matrices; small models can be faster
+on the CPU because of GPU launch overhead.
+
 While mTRFpy only depends on numpy, matplotlib is an optional dependency used to
 visualize models. It can also be installed via pip:
 
@@ -71,6 +99,5 @@ Bialas et al., (2023). mTRFpy: A Python package for temporal response function a
     title = {mTRFpy: A Python package for temporal response function analysis},
     journal = {Journal of Open Source Software} } 
 ```
-
 
 
